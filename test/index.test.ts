@@ -10,7 +10,7 @@ import { namedBeads, observeLifecycle, recordDispatch, waveGate, workerFor } fro
 import { mentionsOrchestrate } from "../src/keyword";
 import { scratchDir } from "./scratch";
 
-const COMPANION_MARKERS = ["beads", "build", "worktrunk"].map(name => Symbol.for(`com.srobroek.${name}.present.v1`));
+const COMPANION_MARKERS = ["beads", "build"].map(name => Symbol.for(`com.srobroek.${name}.present.v1`));
 
 function setCompanions(value: unknown): void {
 	for (const marker of COMPANION_MARKERS) (globalThis as Record<symbol, unknown>)[marker] = value;
@@ -85,7 +85,7 @@ function fixture(mode: string | null): string {
 }
 
 describe("extension factory", () => {
-	test("registers exactly three events and eleven tools, no commands, and reaches no runtime action", () => {
+	test("registers exactly three events and ten tools, no commands, and reaches no runtime action", () => {
 		const { pi, seen } = recordingApi();
 		const timer = spyOn(globalThis, "setInterval");
 		try {
@@ -104,7 +104,6 @@ describe("extension factory", () => {
 			"orc_conflict_probe",
 			"orc_decide",
 			"orc_finish",
-			"orc_next",
 			"orc_release",
 			"orc_review_round_policy",
 			"orc_status",
@@ -140,7 +139,7 @@ describe("companion admission and preflight", () => {
 		const saved = snapshot();
 		clearCompanions();
 		(globalThis as Record<symbol, unknown>)[COMPANION_MARKERS[0] as symbol] = { version: "test" };
-		(globalThis as Record<symbol, unknown>)[COMPANION_MARKERS[2] as symbol] = { version: "test" };
+		(globalThis as Record<symbol, unknown>)[COMPANION_MARKERS[1] as symbol] = { version: "test" };
 		const spawn = spyOn(Bun, "spawn").mockImplementation((() => ({ stdout: new Response("[]").body, stderr: new Response("").body, exited: Promise.resolve(0), kill: () => undefined })) as unknown as typeof Bun.spawn);
 		const { pi, seen } = recordingApi();
 		orchestrateWithBd(pi);
@@ -270,7 +269,7 @@ describe("role tool admission", () => {
 			const injected = await before?.({ prompt: "orchestrate this run" }, ctx) as { message?: { content?: string } };
 			expect(injected.message?.content).toContain("STOP.");
 			const toolCall = seen.eventHandlers.get("tool_call")?.[0];
-			for (const toolName of ["task", "orc_bind", "orc_claim", "orc_next", "orc_decide", "orc_finish", "orc_release", "orc_status"]) {
+			for (const toolName of ["task", "orc_bind", "orc_claim", "orc_decide", "orc_finish", "orc_release", "orc_status"]) {
 				const result = await toolCall?.({ toolName, toolCallId: toolName, input: {} }, ctx);
 				expect(result, toolName).toMatchObject({ block: true, reason: expect.stringContaining("STOP.") });
 			}
@@ -994,9 +993,9 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			E: { id: "E", issue_type: "epic", status: "in_progress", assignee: "omp/s" },
 			// `bd show` shape for edges: { id, dependency_type }.
 			"E.1": { id: "E.1", issue_type: "task", title: "Add subtract", status: "closed", assignee: "impl", metadata: { role: "implementer", tier: "basic" }, dependencies: [{ id: "E", dependency_type: "parent-child" }] },
-			"E.9": { id: "E.9", issue_type: "task", title: "Review", status: "in_progress", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }, { id: "E.1", dependency_type: "blocks" }] },
-            "E.10": { id: "E.10", issue_type: "task", title: "Pending then invalid", status: "in_progress", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }], comments: [{ body: "review-pending: codex 2026-01-01T00:00:00Z", created_at: "2026-01-01T00:00:00Z" }, { body: "metadata-invalid: head", created_at: "2026-01-01T00:00:01Z" }] },
-            "E.11": { id: "E.11", issue_type: "task", title: "Invalid then pending", status: "in_progress", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }], comments: [{ body: "metadata-invalid: head", created_at: "2026-01-01T00:00:00Z" }, { body: "review-pending: codex 2026-01-01T00:00:01Z", created_at: "2026-01-01T00:00:01Z" }] },
+			"E.9": { id: "E.9", issue_type: "task", title: "Review", status: "closed", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }, { id: "E.1", dependency_type: "blocks" }] },
+            "E.10": { id: "E.10", issue_type: "task", title: "Pending then invalid", status: "closed", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }], comments: [{ body: "review-pending: codex 2026-01-01T00:00:00Z", created_at: "2026-01-01T00:00:00Z" }, { body: "metadata-invalid: head", created_at: "2026-01-01T00:00:01Z" }] },
+            "E.11": { id: "E.11", issue_type: "task", title: "Invalid then pending", status: "closed", assignee: "rev", metadata: { role: "reviewer" }, dependencies: [{ id: "E", dependency_type: "parent-child" }], comments: [{ body: "metadata-invalid: head", created_at: "2026-01-01T00:00:00Z" }, { body: "review-pending: codex 2026-01-01T00:00:01Z", created_at: "2026-01-01T00:00:01Z" }] },
         };
 		const argvs: string[][] = [];
 		const spawn = spyOn(Bun, "spawn").mockImplementation(((argv: string[]) => {
@@ -1071,10 +1070,15 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			const subWave = subDetails.wave.map(item => item.bead);
 			expect(subWave).toContain("E.1");
 			expect(subWave).not.toContain("E.old");
+			beads["E.1"]!.status = "in_progress";
+			const writerStatus = await tools.get("orc_status")?.execute("x", {}, undefined, undefined, ctx);
+			expect(waveOf(writerStatus)).toEqual([]);
+			beads["E.1"]!.status = "open";
 			delete beads["E.old"];
 			beads["E.1"]!.status = "closed";
 			beads["E.1"]!.assignee = "impl";
 			runMetadata.run = JSON.stringify(subRun);
+			beads["E.9"]!.status = "in_progress";
 			// 2. A review bead cannot finish done without a verdict; a task cannot carry one.
 			const bare = await tools.get("orc_finish")?.execute("x", { bead: "E.9", state: "done", reason: "ok" }, undefined, undefined, ctx);
 			expect(bare?.isError).toBe(true);
@@ -1094,8 +1098,13 @@ describe("orc_status and orc_finish over the review lifecycle", () => {
 			beads["E.1"]!.assignee = "impl";
 			const status4 = await tools.get("orc_status")?.execute("x", {}, undefined, undefined, ctx);
 			expect(readyOf(status4)).toEqual(["E.9 Review"]);
-            const waiting = (status4?.details as { waiting: Array<{ id: string; provider: string; since: string }> }).waiting;
-            expect(waiting).toEqual([{ id: "E.11", provider: "codex", since: "2026-01-01T00:00:01Z" }]);
+			beads["E.10"]!.status = "in_progress";
+			beads["E.11"]!.status = "in_progress";
+			const status5 = await tools.get("orc_status")?.execute("x", {}, undefined, undefined, ctx);
+			expect(readyOf(status5)).toEqual([]);
+			expect(status5?.details).toMatchObject({
+				waiting: [{ id: "E.11", provider: "codex", since: "2026-01-01T00:00:01Z" }],
+			});
 		} finally {
 			spawn.mockRestore();
 		}

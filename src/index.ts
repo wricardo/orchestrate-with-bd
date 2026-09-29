@@ -1,12 +1,11 @@
 /**
  * orchestrate-with-bd — a durable Beads ledger beside OMP's native `orchestrate` keyword.
  *
- * OMP owns scheduling, agent lifecycle, and cancellation; every agent works in its own
- * Worktrunk git worktree rather than the canonical checkout. This plugin owns three things:
- * the per-session actor every `bd` mutation is attributed to, a run header injected when a
- * prompt says `orchestrate`, and the ledger tools (`orc_claim`, `orc_finish`, `orc_status`)
- * that make Beads the source of truth for what work exists and what state it is in. Four
- * review-bot tools ride along untouched.
+ * OMP owns scheduling, agent lifecycle, and cancellation. This plugin owns the per-session
+ * actor every `bd` mutation is attributed to, a run header injected when a prompt says
+ * `orchestrate`, and the ledger tools (`orc_claim`, `orc_finish`, `orc_status`) that make
+ * Beads the source of truth for work and state. Workers share the current checkout and are
+ * dispatched serially.
  *
  * The plugin does not schedule workers or discover stores. Ownership is lease-only: a claim
  * carries bd's native lease, nothing renews it on a timer, and the recorded lead's next call after
@@ -49,7 +48,6 @@ function ghDiagnostic(result: CommandResult): string {
 const COMPANION_KEYS = [
 	["beads", "com.srobroek.beads.present.v1"],
 	["build", "com.srobroek.build.present.v1"],
-	["worktrunk", "com.srobroek.worktrunk.present.v1"],
 ] as const;
 
 function missingCompanions(): string[] {
@@ -65,7 +63,6 @@ function companionStop(missing: readonly string[]): string {
 const LEDGER_TOOLS: Readonly<Record<string, true>> = Object.freeze({
 	orc_bind: true,
 	orc_claim: true,
-	orc_next: true,
 	orc_decide: true,
 	orc_finish: true,
 	orc_release: true,
@@ -79,15 +76,12 @@ function claimAgent(input: unknown): string | undefined {
 }
 const CONTRACT = [
 	"- Read `skill://orchestrate-with-bd` before dispatching.",
-	"- Beads is the only source of truth for what work exists and what state it is in. The todo list is a per-turn view of `orc_status`, never an independent plan: every item is `<bead-id> <title>` copied from `orc_status.todo`, never invented. On any disagreement, re-read `orc_status` and rewrite the list from it. `orc_finish` makes progress real; `todo done` only redraws the view.",
-	"- In plan mode, the plan must name the epic and every task bead it implements in a `## Beads` section. A step with no bead is not planned work: create the bead first.",
-	"- Dispatch every worker through the native `task` tool. Never start a nested `omp` process. Each worker claims its bead first, then works in the Worktrunk worktree its claim returns or records: `orc_claim` adopts the worktree the bead already carries and otherwise takes the one you created for it.",
-	"- Work in waves. `orc_status.ready` is the wave: one `task` call dispatches every bead in it; the gate refuses a `task` call that omits a ready bead or names one twice; helpers such as `scout` are exempt. A settled batch wakes you with a `task-batch-wake` message: consume receipts, call `orc_status`, and dispatch. `orc_status.held` lists claimed beads; when its worker has ended, `orc_release { bead, holder, reason }` returns the bead to `ready`; `force: true` only after `hub list`/`hub jobs` show no agent on it. Refill happens on every settled child result: re-read `orc_status` and dispatch everything in `orc_status.newly_ready` at once while siblings still run. Implementation results produce pull requests; their review beads run at each PR's exact head before any landing. Approval creates the merge bead described below. A merger wave has landed only when the whole `task` call has returned and every continuation receipt proves its accepted head merged. Never pair an implementer with its immediate reviewer.",
-	"- The DAG decides the shape and `orc_status.shape` states it: `two-tier` (no child epic) means dispatch workers directly; `three-tier` (a direct child of the run epic is an epic) means dispatch one `orc-lead` per child epic, each brief naming its epic and containing the word `orchestrate` so the epic lead receives this same contract. Each epic lead reviews and lands its feature pull request through a merge bead before returning. Once every child epic is closed, `ready` turns to the tasks directly under the run epic: the cross-epic review, dispatched over the landed run (`merge-base..HEAD`). Record cross-epic contracts as a `decision` bead before any epic lead starts. Dispatch `orc-planner` first only when the DAG does not exist yet or the domain is unfamiliar; it writes beads and returns.",
-	"- Each `task` item copies `agent` from the matching `orc_status.wave` entry; you never choose an agent at dispatch time. Implementer tier comes from the bead's `metadata.tier` (`basic` -> `orc-implementer`, `deep` -> `orc-implementer-deep`, `max` -> `orc-implementer-max`); claim-holding implementers and epic leads use their assigned worktree, and so do reviewers, researchers, shepherds, and mergers, whose trees are disposable but still recorded and reclaimed; only a planner and a DAG review claim no worktree. A wave item with `fix` is a same-tier re-run: put its `fix.findings` in the brief. A `planner` item dispatches `orc-planner` with the bead's description.",
-	"- The DAG review comes first. When `orc_status` reports `DAG review required`, run the `bd create` it gives you, then call `orc_status` again: the review bead is the wave, one `orc-reviewer`, before any implementation. Every review bead finishes through `orc_finish` with a `verdict`: `approve` closes it; `fix` (a code defect) and `change` (a criterion not met) reopen the reviewed tasks with the findings for the same implementer at the same tier, at most two rounds; `escalate` with a cause, or a third round, holds the task under `orc_status.decisions`. Tiers are static: only your `orc_decide` (retry, upgrade, split, accept; stop last) moves a held task, and you record the reason. You create no fix beads yourself; a `blocked` implementer whose blocker is a missing prerequisite gets a prerequisite bead at the same tier, which you do create.",
-	"- After a review accepts a pull request, create exactly one merge bead for that accepted head under the epic. Assign it to `pool:orc-merger`; set metadata `{\"role\":\"merger\",\"target\":\"PR_URL\",\"base\":\"BASE_BRANCH\",\"head_sha\":\"REVIEWED_HEAD\",\"receipt\":\"landed+cleaned\"}`; and make it depend on the accepted review. Its sole landing command is `gh pr merge PR_URL MERGE_METHOD --match-head-commit REVIEWED_HEAD`, with one repository-approved merge method and no auto-merge. The atomic expected-head guard is required because the head can change after preflight. Call `orc_status` and dispatch the resulting `orc-merger` wave item. The merger terminally closes every attempt and returns target, base, exact reviewed head, merge SHA or failure, close disposition, and cleanup outcome. Consume that receipt before advancing. Never schedule a replacement until the old bead is closed and its worktree registration, path, and branch are confirmed gone. You retain the integration worktree and resolve every conflict there; the merger never owns integration or conflict policy.",
-	"- Bind first with `orc_bind { epic }`: it claims the epic for you. Lead ledger writes are `orc_bind`, `orc_decide`, and the explicit native Beads commands that create or connect DAG-review, prerequisite, and merge beads; `orc_status` reads. You never claim a task bead or implement product changes; conflict resolution in your integration worktree is the sole code exception. A worker brief must not contain the bare lowercase word `orchestrate`, and it never tells a worker to skip the bead's own acceptance checks: implementers run every criterion's check and the tests they add; only project-wide suites and formatters are deferred to you.",
+	"- Beads is the only source of truth for work and state. The todo list is a per-turn view of `orc_status.todo`, never an independent plan.",
+	"- In plan mode, name the epic and every task bead in a `## Beads` section. Create a bead before planning work for it.",
+	"- This run uses one shared checkout. Never create a git worktree, never request task isolation, and never dispatch a second worker until the first worker has reached a terminal state.",
+	"- Dispatch only the single bead returned by `orc_status.ready` through the native `task` tool. After it returns, call `orc_status` again. Helpers such as `scout` are exempt only when they do not mutate the checkout.",
+	"- Each worker claims its bead first, works in its inherited checkout, runs the bead's acceptance checks, and finishes through `orc_finish`.",
+	"- Bind first with `orc_bind { epic }`. Lead ledger writes are `orc_bind`, `orc_decide`, and explicit native Beads DAG updates; `orc_status` reads. A worker brief must not contain the bare lowercase word `orchestrate`.",
 ].join("\n");
 /** The bash input with both actor names added to its `env`. Malformed env values are replaced with a fresh object. */
 function withActor(input: unknown, actor: string): Record<string, unknown> | undefined {
@@ -130,9 +124,8 @@ const NO_RUN = "no run epic yet — create the epic, then call orc_bind { epic }
 /**
  * Build the run header for one prompt. Exported for keyword tests.
  *
- * The run is read from the ledger, not from a file beside the checkout: every agent works in
- * its own linked worktree, and the canonical root every worktree shares is named here so a
- * lead can see at a glance which checkout its `bd` calls and workflows resolve to.
+ * The run is read from the ledger rather than a file beside the checkout, so every session
+ * resolves the same durable Beads state and repository root.
  */
 export async function runHeader(cwd: string, actor: string, stop?: string, resolveRoot: (cwd: string) => Promise<string> = ledgerRoot, sessionId = actor): Promise<string> {
 	let root: string;

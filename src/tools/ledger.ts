@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { bdRun, BdError, bdCapabilities, type BdBead, type BdCapabilities, bdJson, bdList, bdShow, isGuardMismatch, metadataRecord, parentOf } from "../bd";
-import { beadIds, DESCENDANT_LIMIT, descendants, ownsAgentWorktree, readStoreMode, readyWave, runShape, tierOf, todoStrings, type Descendants, type WaveItem, waveItem } from "../dag";
+import { beadIds, DESCENDANT_LIMIT, descendants, readStoreMode, readyWave, runShape, tierOf, todoStrings, type Descendants, type WaveItem, waveItem } from "../dag";
 import { applyDecision, applyVerdict, dagReviewCommand, type Decision, type DecisionOutcome, type HoldCause, holdOf, isDagReview, type ReopenResult, REVIEW_ROLES, type Tier, type Verdict, type VerdictOutcome } from "../verdict";
 import { type CiScopeReport, ciScopeMessage, scopeCi } from "../ci-scope";
-import { agentBranch, readRunOwnership, readWorktreeBrand, RUN_KEY, type RunOwnership, setMetadata, WORKTREE_KEY, type WorktreeBrand } from "../types";
-import { canonicalRoot, checkLeadWorktree, checkWorktree, type CommandRunner, forgeLanding, landingDecides, projectWorktreeEntries, removalResidue, type RemovalResidue, removeWorktree, residueRemediation, resolveDeepest, spawnCommand, worktreeRoot } from "../worktree";
+import { readRunOwnership, RUN_KEY, type RunOwnership, setMetadata } from "../types";
+import { canonicalRoot } from "../worktree";
 import { startedHoldings, workerFor } from "../dispatch";
 import { lostLeases } from "../lease";
 
@@ -39,10 +39,9 @@ export function missingLandingProof(bead: BdBead): string[] {
   return fields.filter(field => typeof metadata?.[field] !== "string" || metadata[field].trim().length === 0);
 }
 /**
- * The canonical checkout for one tool call. Every `bd` call runs there: an agent's `ctx.cwd`
- * is its own linked worktree, and the store — like `.github/workflows` — lives in canonical,
- * which every linked worktree shares through the git common directory. Successful answers are
- * cached per cwd; transient probe failures are evicted so a later tool call can recover.
+ * The repository root for one tool call. Every `bd` call runs there so workers sharing a
+ * checkout also share its embedded store. Successful answers are cached per cwd; transient
+ * probe failures are evicted so a later tool call can recover.
  */
 const canonicalByCwd = new Map<string, Promise<string>>();
 
@@ -151,8 +150,7 @@ export async function discoverRun(root: string, actor: string, list: typeof bdLi
 
 /**
  * The run a bead belongs to: the nearest ancestor-or-self epic carrying `metadata.run`,
- * found by walking parent edges. This is what makes the `run` on a worktree brand a fact
- * rather than a claimant's assertion — the claimant never supplies it.
+ * found by walking parent edges. The claimant never supplies this ledger-owned identity.
  */
 export async function runOf(bead: BdBead, root: string, env: Record<string, string>): Promise<OwnedRun | null> {
 	let current: BdBead | undefined = bead;
@@ -321,37 +319,7 @@ export interface ClaimResult {
 	bead?: BdBead;
 	lease_expires_at?: string;
 	reason?: string;
-	/** The bead's worktree: adopted from a prior attempt, or branded onto the bead by this claim. */
-	worktree?: WorktreeBrand;
-	/** True when `worktree` came from a prior attempt; the claimant works there, it creates nothing. */
-	adopted?: boolean;
-	/**
-	 * True when the worktree the bead recorded was no longer usable and the one supplied to this
-	 * call replaced it. The dead record is gone; `worktree` is the tree to work in.
-	 */
-	replaced?: boolean;
-	/**
-	 * True when the recorded worktree is no longer this bead's — pruned between attempts, or its
-	 * path now reported on another branch — and no replacement was supplied. The claimant
-	 * recreates it at `omp/agent/<bead>` and passes it to `orc_claim`, which replaces the record.
-	 */
-	worktree_missing?: boolean;
-	/** True when the bead is held but still unbranded: create the worktree and claim again. */
-	needs_worktree?: true;
-	/** What is still missing, with the two commands that finish the branding. */
-	worktree_pending?: string;
 }
-/** One pull result; `inflight` distinguishes polling from a drained run. */
-export interface NextResult {
-	claimed: boolean;
-	bead?: BdBead;
-	worktree?: WorktreeBrand;
-	pending?: string;
-	ready?: number;
-	inflight?: number;
-	reason?: string;
-}
-
 export interface BindResult {
 	run: string | null;
 	root: string;
@@ -367,9 +335,8 @@ export interface FinishResult {
 	bead: string;
 	/** Present when the bead is a review bead: what the verdict did. */
 	verdict?: VerdictOutcome;
-	/** Present when the bead carried a worktree: observed registration, path, and branch state. */
-	worktree?: { path: string; branch: string; removed: boolean; error?: string; retained?: RemovalResidue };
 }
+
 export interface ReleaseResult {
 	released: boolean;
 	tier?: "own" | "worker-ended:completed" | "worker-ended:failed" | "worker-ended:aborted" | "reclaimed" | "forced";
@@ -540,9 +507,9 @@ function guardedUpdate(updateArgs: readonly string[], assignee: string, status: 
 }
 
 /**
- * Reopen a reviewed task without stealing a live claim; stale claims are released atomically into
- * their phase queue. Every `bd` call takes the ledger root rather than `ctx.cwd`, because an
- * embedded store lives in the canonical checkout and a worker calls this from its own worktree.
+ * Reopen a reviewed task without stealing a live claim; stale claims are released atomically
+ * into their phase queue. Every `bd` call takes the repository root so all workers use one
+ * embedded store.
  */
 async function reopenVerdictTask(
 	task: BdBead,
@@ -616,74 +583,14 @@ async function reopenVerdictTask(
 	}
 }
 
-/**
- * Give a finished round's worktree back through `wt` without destructive flags. Without `-f`
- * Worktrunk refuses uncommitted changes, and without `-D` it preserves an unmerged branch. The
- * command's status explains why it stopped; the post-call probes below determine what remains.
- *
- * No exit status is taken as the resulting state. `wt remove` can exit zero while keeping an
- * unmerged branch, and a failure or timeout can arrive after one or more removal steps completed.
- * The command's process tree must first be confirmed quiescent; registration, filesystem path,
- * and branch are then read independently after every call. Only a quiescent removal whose three
- * observed states are gone is reported reclaimed. Anything retained is recorded on the bead and
- * handed to the lead with remediation for that observed state —
- * it is never retried around, never force-removed, and it never turns a landed close into a tool
- * error.
- *
- * A reclaimed brand is *cleared*, not kept as history: the tree it names is gone, and the next
- * attempt on a bead that reopens — a fix round or a retry — must record the tree it creates at
- * the current head rather than adopt a path that no longer exists.
- */
-async function reclaimWorktree(bead: BdBead, root: string, env: Record<string, string>, run: CommandRunner): Promise<FinishResult["worktree"]> {
-	const brand = readWorktreeBrand(bead);
-	if (brand === null) return undefined;
-	// The brand was validated against `git worktree list` when it was written, and it is
-	// validated again here, because here is where it becomes argv. Metadata is editable by
-	// anything that can reach the store, and this branch string is what `wt remove` acts on: a
-	// record naming any other branch is handed to the lead instead of removed on its word.
-	const expected = agentBranch(bead.id);
-	if (brand.branch !== expected) {
-		const error = `the recorded branch ${brand.branch} is not this bead's ${expected}, so nothing was removed; check metadata.worktree, then reclaim the tree yourself with \`wt -C ${root} remove -y --foreground <branch>\``;
-		await bdJson(["comment", bead.id, `worktree ${brand.path} (${brand.branch}) not reclaimed: ${error}`], root, env).catch(() => undefined);
-		return { path: brand.path, branch: brand.branch, removed: false, error };
-	}
-	const removal = await removeWorktree(root, brand.branch, run);
-	const observed = await removalResidue(root, brand.path, brand.branch, run);
-	const residue: RemovalResidue = removal.quiescence.confirmed ? observed : { ...observed, quiescenceError: removal.quiescence.reason };
-	if (removal.quiescence.confirmed && !residue.worktree && !residue.path && !residue.branch) {
-		await bdJson(["update", bead.id, "--set-metadata", setMetadata(WORKTREE_KEY, null), "--json"], root, env).catch(() => undefined);
-		return { path: brand.path, branch: brand.branch, removed: true };
-	}
-	const failure = removal.code === 0 ? undefined : removal.stderr.trim() || removal.stdout.trim() || `wt remove exited ${removal.code}`;
-	// A branch git calls unmerged is the one anomaly a forge answer can settle, so it is the only
-	// place that pays for a `gh` call: `git branch --list` cannot distinguish a squash-landed branch
-	// from an unmerged one, and the remediation this hands the lead is wrong in both directions if
-	// it guesses. Every other residue is decided by git alone, so the subprocess is skipped.
-	const landing = landingDecides(residue) ? await forgeLanding(root, brand.branch) : undefined;
-	const remediation = residueRemediation(root, brand.path, brand.branch, residue, landing);
-	const error = failure === undefined ? remediation : `${failure} — ${remediation}`;
-	const orphaned: WorktreeBrand = { ...brand, orphaned: true, removal_error: error, retained: residue };
-	await bdJson(["comment", bead.id, `worktree ${brand.path} (${brand.branch}) not fully reclaimed: ${error}`], root, env).catch(() => undefined);
-	await bdJson(["update", bead.id, "--set-metadata", setMetadata(WORKTREE_KEY, orphaned), "--json"], root, env).catch(() => undefined);
-	return { path: brand.path, branch: brand.branch, removed: false, error, retained: residue };
-}
 
-/** The worktree sentence appended to a finish line: nothing, reclaimed, or the lead's problem. */
-function worktreeLine(worktree: FinishResult["worktree"]): string {
-	if (worktree === undefined) return "";
-	if (worktree.removed) return `\nworktree registration and path ${worktree.path} gone, and ${worktree.branch} deleted; all three confirmed gone`;
-	return `\nworktree ${worktree.path} (${worktree.branch}) was NOT fully reclaimed and is marked orphaned: ${worktree.error}\nremediate it yourself; nothing was force-removed.`;
-}
-
-export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spawnCommand): void {
+export function registerLedger(pi: ExtensionAPI): void {
 	const z = pi.zod;
 	// Named consts, not inline `z.object(...)` arguments: inlined, the generic no longer
 	// infers and `input` degrades to `unknown`.
 	const claimParams = z.object({
 		bead: z.string().describe("bead id to claim"),
 		agent: z.string().optional().describe("agent type dispatched for this bead"),
-		worktree: z.string().optional().describe("absolute path of the worktree you created for this bead; omit to adopt the worktree the bead already carries"),
-		branch: z.string().optional().describe("branch of that worktree; must be omp/agent/<bead-id>"),
 	});
 	const finishParams = z.object({
 		bead: z.string().describe("bead id"),
@@ -710,10 +617,8 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 		action: z.enum(["retry", "upgrade", "split", "accept", "stop"]),
 		reason: z.string().describe("why this action; recorded as a comment on the task"),
 	});
-	const nextParams = z.object({ run: z.string().describe("run epic id; workers do not bind runs"), agent: z.string().optional().describe("claiming agent type, used to select a queue") });
 	const bindParams = z.object({
 		epic: z.string().describe("run epic id to bind this checkout to"),
-		worktree: z.string().optional().describe("absolute path of the integration worktree"),
 		liveAgents: z.array(z.string()).optional().describe("agent ids visible in hub list; omit when liveness is unknown"),
 		force: z.boolean().optional().describe("user-authorized takeover; requires reason"),
 		reason: z.string().optional().describe("required with force; recorded on takeover"),
@@ -723,8 +628,7 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 	pi.registerTool({
 		name: "orc_release",
 		label: "Release bead",
-		description:
-			"Release a held bead after worker-ended, own, or explicit force evidence. The bead keeps its worktree: the next holder adopts it, so a release hands over the prior attempt's tree rather than discarding it.",
+		description: "Release a held bead after worker-ended, own, or explicit force evidence.",
 		approval: "write",
 		parameters: releaseParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ReleaseResult | undefined>> {
@@ -739,8 +643,6 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 			await renewExpiredLeadLease(root, actor);
 			const capabilities = await bdCapabilities(root);
 			try {
-				// `metadata.worktree` is deliberately untouched on every path below: it belongs to
-				// the bead, not to the actor being released, and the successor claims it by adopting.
 				const before = await bdShow(input.bead, root, env);
 				const bound = (await runOf(before, root, env)) ?? (await mutationRun(root, actor));
 				await assertInRun(input.bead, bound, root);
@@ -789,8 +691,8 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 	pi.registerTool({
 		name: "orc_claim",
 		label: "Claim bead",
-    description:
-      "Claim one Beads task for this agent and brand its worktree. Native `bd update --claim` makes the open/unassigned transition atomic and stamps a lease that expires without a renewal timer. A bead's work happens in a linked worktree on `omp/agent/<bead-id>`: when the bead already carries one — a fix round or a retry — the claim revalidates it against `git worktree list` and returns it, and you work there, because the prior attempt's code is in it. A tier escalation is a different bead and carries no worktree: it creates its own, based on the branch its brief names. Otherwise the claim comes first and the worktree second: claim, create the worktree it names, then call this again with `worktree` and `branch` to brand it. `git worktree list` must report the exact path and branch pair; the branch must be `omp/agent/<bead-id>`, and the path must be outside canonical.",
+		description:
+			"Claim one Beads task for this agent. Native `bd update --claim` makes the open/unassigned transition atomic and stamps a lease that expires without a renewal timer. Single-checkout mode dispatches one bead at a time, so the claimed worker operates in the repository checkout it inherited.",
 		parameters: claimParams,
 		approval: "write",
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<ClaimResult | undefined>> {
@@ -801,14 +703,9 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 			try {
 				root = await ledgerRoot(ctx.cwd);
 			} catch (error) {
-				return refused<ClaimResult | undefined>(`orc_claim ${bead}: refused, canonical checkout unknown: ${ledgerFailure(error)}`);
+				return refused<ClaimResult | undefined>(`orc_claim ${bead}: refused, checkout unknown: ${ledgerFailure(error)}`);
 			}
 			await renewExpiredLeadLease(root, actor);
-			// Read before claiming, but never *gate* the claim on a worktree: D10 is claim first,
-			// then worktree, so a branch never exists while its bead is unclaimed. A first claim
-			// with no worktree is taken and answered with the two commands that brand it. The same
-			// read decides queue eligibility below, so a bead that cannot be read refuses instead
-			// of claiming: a queued bead must never be taken while its queue is unknown.
 			let before: BdBead;
 			try {
 				before = await bdShow(bead, root, env);
@@ -823,117 +720,25 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 				if (agent.length === 0) return refused(`orc_claim ${bead}: refused, queue ${queue} is unreadable without a claiming agent`);
 				if (QUEUE_AGENTS[queue] !== agent) return refused(`orc_claim ${bead}: refused, bead ${bead} is in queue ${queue}, but agent ${agent} tried`);
 			}
-			const existing = readWorktreeBrand(before);
-			// An adopted brand is revalidated, never trusted, and it is revalidated *here* because
-			// what it is decides what this call may do. It was written in an earlier round, and
-			// between rounds a worktree is pruned, or its path is released and taken by another
-			// bead's tree — `wt` names paths after branches, and a retried bead is not the only
-			// thing that gets a path. `checkWorktree` is the same check branding applies, path and
-			// branch read from one `git worktree list` record, so a successor is never sent into
-			// another bead's work, where it would commit onto that branch while every later cleanup
-			// addressed this one.
-			const listed = await projectWorktreeEntries(root);
-			if (listed.kind === "unknown") return refused<ClaimResult | undefined>(`orc_claim ${bead}: refused, ${listed.reason}`);
-			const worktrees = listed.entries;
-			const adoptedCheck = existing === null ? null : checkWorktree({ bead, worktree: existing.path, branch: existing.branch, canonical: root, worktrees });
-			const deadBrand = adoptedCheck === null || adoptedCheck.ok ? undefined : adoptedCheck.reason;
-			// A brand git no longer backs is a dead record, not a worktree, so a replacement the
-			// claimant supplies is accepted and validated exactly like a first one. Ignoring it —
-			// which is what "brand only when there is no brand" did — left the bead unworkable:
-			// its recorded path was unusable, and no tool could write another, so recovery needed a
-			// hand edit of the bead's metadata. A brand that still checks out is not replaceable
-			// here: that tree holds the prior attempt, and this round continues it.
-			const wantsBrand = ownsAgentWorktree(before) && (existing === null || deadBrand !== undefined);
-			let supplied: WorktreeBrand | undefined;
-			let pending: string | undefined;
-			if (wantsBrand) {
-				const worktree = input.worktree?.trim();
-				const branch = input.branch?.trim() ?? agentBranch(bead);
-				const recreate = `  wt switch -y --create --no-cd --base <base-branch> --format json ${agentBranch(bead)}\n  orc_claim { bead: "${bead}", worktree: "<the path it printed>", branch: "${agentBranch(bead)}" }`;
-				if (worktree === undefined || worktree.length === 0) {
-					pending =
-						deadBrand === undefined
-							? `this bead has no worktree yet. You hold it now, so create the worktree and brand it:\n${recreate}`
-							: `the worktree this bead recorded is not usable: ${deadBrand}\nYou hold the bead. Recreate the tree and pass it here; this claim replaces the dead record:\n${recreate}`;
-				} else {
-					const check = checkWorktree({ bead, worktree, branch, canonical: root, worktrees });
-					if (check.ok) supplied = { path: check.path, branch };
-					else pending = `${check.reason}\nthe claim stands; call orc_claim again with a worktree that passes`;
-				}
+			let claimHolder: string | undefined;
+			try {
+				await bdJson(["update", bead, "--claim", "--json"], root, env);
+			} catch (error: unknown) {
+				claimHolder = claimedHolder(error);
+				if (claimHolder === undefined) return refused(`orc_claim ${bead}: refused, ${ledgerFailure(error)}`);
 			}
-      let claimHolder: string | undefined;
-      try {
-        await bdJson(["update", bead, "--claim", "--json"], root, env);
-      } catch (error: unknown) {
-        claimHolder = claimedHolder(error);
-        if (claimHolder === undefined) return refused(`orc_claim ${bead}: refused, ${ledgerFailure(error)}`);
-      }
-      const observed = await bdShow(bead, root, env);
-      if (claimHolder !== undefined) {
-        const holder = observed.assignee ?? claimHolder;
-        const reason = `held by ${holder}`;
-        return text<ClaimResult>({ claimed: false, bead: observed, reason }, `orc_claim ${bead}: not claimed, ${reason}`);
-      }
-      if (observed.assignee !== actor) {
-        const holder = observed.assignee ?? "(unassigned)";
-        const reason = `held by ${holder}`;
-        return text<ClaimResult>({ claimed: false, bead: observed, reason }, `orc_claim ${bead}: not claimed, ${reason}`);
-      }
-      if (typeof observed.lease_expires_at !== "string" || observed.lease_expires_at.trim().length === 0)
-        return refused(`orc_claim ${bead}: claim-failed: no lease after claim`);
-			let brand = existing ?? undefined;
-			if (supplied !== undefined) {
-				// The run is resolved from the bead's ancestry, never taken from the claimant: a
-				// worktree branded with a run it does not belong to would route its PR at the wrong
-				// integration branch.
-				const owned = await runOf(observed, root, env).catch(() => null);
-				const written: WorktreeBrand = { ...supplied, claimed_at: new Date().toISOString(), ...(owned === null ? {} : { run: owned.epic.id }) };
-				try {
-					await bdJson(["update", bead, "--set-metadata", setMetadata(WORKTREE_KEY, written), "--json"], root, env);
-					brand = written;
-				} catch (error) {
-					// The claim is *not* given back: under D10 the claimant already holds the bead and
-					// its worktree exists, so dropping the claim would strand a real tree behind an
-					// unclaimed bead. bd's own message is kept intact — the retry rule matches that
-					// text — and the claimant brands again with the same arguments.
-					const message = error instanceof Error ? error.message : String(error);
-					pending = `the worktree could not be recorded on the bead: ${message}\nyou hold the bead; call orc_claim again with the same worktree and branch`;
-				}
+			const observed = await bdShow(bead, root, env);
+			if (claimHolder !== undefined || observed.assignee !== actor) {
+				const holder = observed.assignee ?? claimHolder ?? "(unassigned)";
+				const reason = `held by ${holder}`;
+				return text<ClaimResult>({ claimed: false, bead: observed, reason }, `orc_claim ${bead}: not claimed, ${reason}`);
 			}
-			// `adopted` is the prior attempt's tree carried into this round. A replacement is not
-			// that: the claimant created it in this call, so it reads like a first branding, and the
-			// dead record it displaced is gone rather than reported as this bead's worktree.
-			const replaced = existing !== null && supplied !== undefined && brand !== existing;
-			const adopted = existing !== null && supplied === undefined;
-			const stale = supplied === undefined ? deadBrand : undefined;
-			const missing = stale !== undefined;
-			const result: ClaimResult = {
-				claimed: true,
-				bead: observed,
-				lease_expires_at: observed.lease_expires_at,
-				...(brand === undefined ? {} : { worktree: brand }),
-				...(adopted ? { adopted: true } : {}),
-				...(replaced ? { replaced: true } : {}),
-				...(missing ? { worktree_missing: true } : {}),
-				...(pending === undefined ? {} : { needs_worktree: true, worktree_pending: pending }),
-			};
-			const lease = observed.lease_expires_at === undefined ? "" : `; lease expires ${observed.lease_expires_at}`;
-			const where =
-				pending !== undefined
-					? `\n${pending}`
-					: brand === undefined
-						? ""
-						: missing
-							? `\nthe worktree this bead recorded is not usable: ${stale}\nrecreate it and pass it to orc_claim, which replaces the dead record: wt switch -y --create --no-cd --base <base-branch> --format json ${agentBranch(bead)}`
-							: adopted
-								? `\nwork in the worktree this bead already owns, it holds the prior attempt: ${brand.path} (${brand.branch})`
-								: replaced
-									? `\nthe worktree this bead recorded was not usable and has been replaced: ${brand.path} (${brand.branch})`
-									: `\nworktree recorded: ${brand.path} (${brand.branch})`;
-			// A first claim that simply has no worktree yet is the normal path and not an error; a
-			// worktree the claimant *supplied* and this ledger rejected is, so it is flagged.
-			const rejected = pending !== undefined && (input.worktree?.trim() ?? "").length > 0;
-			return text<ClaimResult>(result, `orc_claim ${bead}: claimed by ${actor}${lease}${where}`, rejected);
+			if (typeof observed.lease_expires_at !== "string" || observed.lease_expires_at.trim().length === 0)
+				return refused(`orc_claim ${bead}: claim-failed: no lease after claim`);
+			return text<ClaimResult>(
+				{ claimed: true, bead: observed, lease_expires_at: observed.lease_expires_at },
+				`orc_claim ${bead}: claimed by ${actor}; lease expires ${observed.lease_expires_at}`,
+			);
 		},
 	});
 
@@ -966,7 +771,7 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 			if (role === "merger" && input.state === "blocked") {
 				return text<FinishResult>(
 					{ state: "blocked", bead },
-					`orc_finish ${bead}: refused, a merge bead's landing attempt is terminal; finish it done with the failure disposition so its throwaway worktree is reclaimed`,
+					`orc_finish ${bead}: refused, a merge bead's landing attempt is terminal; finish it done with the failure disposition`,
 					true,
 				);
 			}
@@ -1006,14 +811,7 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 					} catch (error) {
 						return text<FinishResult>({ state: "done", bead }, error instanceof Error ? error.message : String(error), true);
 					}
-					// Every verdict ends the round that produced it, so the reviewer's worktree goes
-					// back here whatever the verdict was. A `fix` or `change` leaves the review bead
-					// open for a second round, and that round judges a *new* head: keeping the tree
-					// would hand it the code it already reviewed, and `references/landing.md` and
-					// `agents/orc-reviewer.md` both promise the checkout is rebuilt at the PR head
-					// each round. The brand is cleared with it, so the next claim records its own.
-					const reclaimed = await reclaimWorktree(current, root, env, reclaimRun);
-					return text<FinishResult>({ state: "done", bead, verdict: outcome, ...(reclaimed === undefined ? {} : { worktree: reclaimed }) }, `${outcome.line}${worktreeLine(reclaimed)}`);
+					return text<FinishResult>({ state: "done", bead, verdict: outcome }, outcome.line);
 				}
 				if (input.verdict !== undefined) {
 					return text<FinishResult>({ state: "done", bead }, `orc_finish ${bead}: refused, a verdict applies to a review bead; this bead's role is ${typeof role === "string" && role.length > 0 ? role : "(none)"}`, true);
@@ -1053,8 +851,7 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 					const pushed = await bdRun(["dolt", "push"], root, env);
 					sync = pushed.code === 0 ? "ok" : `push-failed: ${pushed.stderr.trim().split(/\r?\n/u, 1)[0] || `bd exited ${pushed.code}`}`;
 				}
-				const reclaimed = await reclaimWorktree(current, root, env, reclaimRun);
-        return text<FinishResult>({ state: "done", bead, ...(sync === undefined ? {} : { sync }), ...(reclaimed === undefined ? {} : { worktree: reclaimed }) }, `orc_finish ${bead}: done${sync === undefined ? "" : ` (sync: ${sync})`}${worktreeLine(reclaimed)}`);
+				return text<FinishResult>({ state: "done", bead, ...(sync === undefined ? {} : { sync }) }, `orc_finish ${bead}: done${sync === undefined ? "" : ` (sync: ${sync})`}`);
 			}
 			if (input.force === true && input.reason.trim().length === 0) return refused(`orc_finish ${bead}: force requires reason`);
 			try {
@@ -1065,9 +862,6 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 				if (isGuardMismatch(error)) return refused(`lease-lost: current assignee ${(await bdShow(bead, root, env)).assignee ?? "(unassigned)"}`);
 				return refused(ledgerFailure(error));
 			}
-			// A blocked bead keeps its worktree. Its work is unfinished, and the successor that
-			// picks the bead up — a retry, or a higher tier — adopts that tree as its starting
-			// point; reclaiming it here would discard exactly what the next attempt needs.
 			return text<FinishResult>({ state: "blocked", bead }, `orc_finish ${bead}: blocked`);
 		},
 	});
@@ -1090,34 +884,7 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 			const epic = input.epic.trim();
 			const actor = actorFor(ctx);
 			const env = { BEADS_ACTOR: actor };
-			// Resolve the checkout the CI pass would mutate before any claim or ledger write. An
-			// explicit canonical path is refused, while an implicit canonical cwd remains report-only.
-			// Every non-canonical target, supplied or current, must be the exact integration worktree
-			// for this epic; an agent branch must never receive a run-level edit.
-			const target = input.worktree?.trim() ?? "";
-			let tree: string;
-			if (target.length > 0) tree = target;
-			else {
-				const resolved = await worktreeRoot(ctx.cwd);
-				if (resolved.kind === "unknown") {
-					const message = `orc_bind ${epic}: refused, worktree unknown: ${resolved.reason}`;
-					return text<BindResult>({ run: null, root: epic, message }, message, true);
-				}
-				tree = resolved.root;
-			}
-			if (target.length > 0 || resolveDeepest(tree) !== resolveDeepest(root)) {
-				const listed = await projectWorktreeEntries(root);
-				if (listed.kind === "unknown") {
-					const message = `orc_bind ${epic}: refused, ${listed.reason}`;
-					return text<BindResult>({ run: null, root: epic, message }, message, true);
-				}
-				const check = checkLeadWorktree({ epic, worktree: tree, canonical: root, worktrees: listed.entries });
-				if (!check.ok) {
-					const message = `orc_bind ${epic}: ${check.reason}. Pass the worktree on omp/integration/${epic}, or no worktree from canonical to have CI files reported as pending; nothing was bound.`;
-					return text<BindResult>({ run: null, root: epic, message }, message, true);
-				}
-				tree = check.path;
-			}
+			const tree = root;
 			// The run this lead already owns, read from the ledger. It is what refuses a second
 			// unrelated bind, the job the checkout-scoped locator used to do badly: `task` cannot
 			// give a child its own cwd, so a root lead and an epic lead shared one file.
@@ -1218,19 +985,9 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 				const message = `epic ${epic} is held by ${holder}; a lead binds only the epic it claims`;
 				return text<BindResult>({ run: null, root: rootId, message }, message, true);
 			}
-			// D18, as behaviour rather than a question: an unscoped repository runs its whole PR
-			// matrix on every agent branch, so the exclusion is added here and reported, and the
-			// outcome is recorded on the run so a later session can see it was done. It is never
-			// applied at the ledger root: canonical's working tree is never mutated
-			// (`references/landing.md`).
-			//
-			// The shipped sequence binds from canonical, before the lead has an integration
-			// worktree, and a second bind from that worktree would be a different session and a
-			// different actor — which the live binding refuses. So the target is a parameter (read
-			// and validated above): the lead creates its integration worktree, names it here, and
-			// the edit lands where its commit can carry it. With no target and canonical as the
-			// tree, the files are reported pending instead of written.
-			const ci = scopeCi(tree, resolveDeepest(tree) === resolveDeepest(root) ? "report" : "apply");
+			// A single-checkout run does not create an integration branch. Keep CI inspection
+			// report-only; the user can make any required workflow change explicitly.
+			const ci = scopeCi(tree, "report");
 			const reviewEpoch = lookup.state === "bound" && lookup.owned.run.review_epoch.length > 0 ? lookup.owned.run.review_epoch : randomUUID();
 			const ownership: RunOwnership = { owner: actor, bound_at: new Date().toISOString(), review_epoch: reviewEpoch, root: rootId, ci_scoped: ci.scoped, ...(displaced === null ? {} : { transferred_from: displaced.owner }) };
 			await bdJson(["update", epic, "--set-metadata", setMetadata(RUN_KEY, ownership), "--json"], root, env);
@@ -1292,84 +1049,11 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 			return text<DecisionOutcome>(outcome, outcome.line);
 		},
 	});
-	pi.registerTool({
-		name: "orc_next",
-		label: "Pull next bead",
-		description: "Pull one ready bead under a named run, atomically claiming it for this worker.",
-		approval: "write",
-		parameters: nextParams,
-		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<NextResult | undefined>> {
-			let root: string;
-			try {
-				root = await ledgerRoot(ctx.cwd);
-			} catch (error) {
-				return refused<NextResult | undefined>(`orc_next refused, canonical checkout unknown: ${ledgerFailure(error)}`);
-			}
-			const actor = actorFor(ctx);
-			const env = { BEADS_ACTOR: actor };
-			const capabilities = await bdCapabilities(root);
-			const runId = input.run.trim();
-			let runBead: BdBead;
-			try {
-				runBead = await bdShow(runId, root, env, capabilities.briefDeps ? ["--brief-deps"] : []);
-			} catch (error) {
-				return refused(`orc_next ${runId}: refused, run unreadable: ${ledgerFailure(error)}`);
-			}
-			if (runBead.issue_type !== "epic") return refused(`orc_next ${runId}: refused, not an epic`);
-			const runOwnership = readRunOwnership(runBead);
-			if (runOwnership === null) return refused(`orc_next ${runId}: refused, named epic lacks metadata.run`);
-			if (!runIsLive(runBead)) return refused(`orc_next ${runId}: refused, run lease is not live`);
-			const walk = await descendants(runId, root, capabilities);
-			if (walk.truncated) return refused(`orc_next ${runId}: refused, subtree exceeds ${DESCENDANT_LIMIT} beads; ready is withheld`);
-			const currentDagReview = walk.beads.some(bead => isDagReview(bead) && metadataRecord(bead.metadata)?.review_epoch === runOwnership.review_epoch);
-			if (runOwnership.root === runId && !currentDagReview && walk.beads.some(bead => bead.issue_type === "task"))
-				return refused(`orc_next ${runId}: refused, current-generation DAG review required; call orc_status`);
-			const readyBeads = await readyWave(runId, walk.beads, root, capabilities, runOwnership.review_epoch);
-			const agent = input.agent?.trim() ?? "";
-			const stale = walk.beads.filter(bead =>
-				bead.status === "in_progress" &&
-				typeof bead.lease_expires_at === "string" &&
-				(parseNativeLeaseTimestamp(bead.lease_expires_at) ?? Infinity) <= Date.now() &&
-				(!isDagReview(bead) || metadataRecord(bead.metadata)?.review_epoch === runOwnership.review_epoch),
-			);
-			const candidatePool = [...readyBeads, ...stale.filter(bead => !readyBeads.some(ready => ready.id === bead.id))];
-			const candidates = candidatePool.filter(bead => {
-				const queue = beadQueue(bead);
-				return queue === undefined || (agent.length > 0 && QUEUE_AGENTS[queue] === agent);
-			});
-			for (const candidate of candidates) {
-				try {
-					const ownership = readRunOwnership(runBead);
-					if (ownership === null) return refused(`orc_next ${runId}: refused, named epic lacks metadata.run`);
-					await assertInRun(candidate.id, { epic: runBead, run: ownership }, root);
-				} catch (error) {
-					return refused(ledgerFailure(error));
-				}
-				try {
-					await bdJson(["update", candidate.id, "--claim", "--json"], root, env);
-				} catch (error) {
-					if (claimedHolder(error) !== undefined) continue;
-					return refused(ledgerFailure(error));
-				}
-				const observed = await bdShow(candidate.id, root, env);
-				if (observed.assignee !== actor) continue;
-				if (typeof observed.lease_expires_at !== "string" || observed.lease_expires_at.trim().length === 0)
-					return refused(`orc_next ${runId}: claim-failed: no lease after claim`);
-				const existing = readWorktreeBrand(observed);
-				const pending = existing === null ? `this bead has no worktree yet. You hold it now, so create the worktree and brand it with orc_claim:\n  wt switch -y --create --no-cd --base <base-branch> --format json ${agentBranch(candidate.id)}` : undefined;
-				return text<NextResult>({ claimed: true, bead: observed, ...(existing === null ? {} : { worktree: existing }), ...(pending === undefined ? {} : { pending }) }, `orc_next ${candidate.id}: claimed by ${actor}${pending === undefined ? "" : `\n${pending}`}`);
-			}
-			const inflight = walk.beads.filter(bead => bead.status === "in_progress").length;
-			const reason = inflight > 0 ? "nothing claimable yet; siblings are still running, poll again" : "nothing ready and nothing running; exit";
-			return text<NextResult>({ claimed: false, ready: readyBeads.length, inflight, reason }, `orc_next ${runId}: ${reason}`);
-		},
-	});
 
 	pi.registerTool({
 		name: "orc_status",
 		label: "Run status",
-		description: "On this lead's next call after the recorded epic lease expires, status renews it with one native `bd heartbeat <epic> --json`; live leases are not rewritten. " +
-			"Read the bound run's whole subtree from Beads; this tool writes nothing, bind first with `orc_bind`. `ready` is the wave and one `task` call dispatches all of it; `wave` gives each item's `agent`, which the `task` call copies (implementer tier from the bead's `metadata.tier`): unblocked, unassigned tasks under the epic (two-tier), or the child epics that are unblocked, not yet bound by a lead, and hold at least one ready task, one `orc-lead` each (three-tier). `newly_ready` is the part of `ready` that was not ready when you last called this tool: call orc_status on every child result and dispatch `newly_ready` at once, never waiting for a wave to drain. `todo` holds `<bead-id> <title>` for every open or in-progress bead and is the only legitimate source of todo items. `shape` is `three-tier` when a direct child of the epic is an epic (dispatch one `orc-lead` per child epic) and `two-tier` otherwise. `epic`, when passed, must be the bound run.",
+		description: "Read the bound run's whole subtree from Beads; bind first with `orc_bind`. Single-checkout mode returns no ready bead while any descendant is in progress, then returns exactly one unblocked bead. Dispatch that one worker, wait for it to finish, and call `orc_status` again. `todo` holds `<bead-id> <title>` for every open or in-progress bead.",
 		approval: "read",
 		parameters: statusParams,
 		async execute(_id, input, _signal, _update, ctx): Promise<AgentToolResult<StatusResult | undefined>> {
@@ -1422,11 +1106,11 @@ export function registerLedger(pi: ExtensionAPI, reclaimRun: CommandRunner = spa
 			statusIdsBySession.set(ctx.sessionManager.getSessionId(), beadIds(walk.beads));
 			const todo = todoStrings(walk.beads);
 			const shape = runShape(epic, walk.beads);
-			// A truncated walk is not a basis for a wave: the epic tier's terminal check and the
-			// two-tier task list both read the snapshot, so `ready` is withheld instead of guessed.
+			// One shared checkout permits only one active descendant at a time.
+			const activeDescendant = walk.beads.some(bead => bead.id !== epic && bead.status === "in_progress");
 			let readyBeads: BdBead[];
 			try {
-				readyBeads = walk.truncated || dagReviewMissing ? [] : await readyWave(epic, walk.beads, root, capabilities, reviewEpoch);
+				readyBeads = activeDescendant || walk.truncated || dagReviewMissing ? [] : (await readyWave(epic, walk.beads, root, capabilities, reviewEpoch)).slice(0, 1);
 			} catch (error) {
 				clearStatusWave(ctx);
 				return refused(error instanceof Error ? error.message : String(error));

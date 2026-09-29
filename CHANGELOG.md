@@ -3,8 +3,8 @@
 
 ### Changed
 
-* remove native OMP isolation in favor of Worktrunk linked worktrees and require the beads, build, and worktrunk companion plugins
-* remove Worktrunk Dolt hooks and make run agents the sole writers of `BD_ACTOR` and `BEADS_ACTOR`
+* replace the Worktrunk linked-checkout requirement with one shared checkout and serialized code-writing dispatch
+* remove the Worktrunk companion plugin, claim path and branch metadata, the sweeper, and `orc_next`
 * use lease-only ledger ownership, scoped verdict targets, and the `needs-evidence` verdict grammar
 * fail closed on malformed Beads payloads
 

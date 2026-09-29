@@ -136,14 +136,14 @@ if (process.env.NEGATIVE_REWRITE === "1") {
 }
 const before = handlers.get("before_agent_start");
 if (!before) throw new Error("before_agent_start handler was not registered");
-for (const plugin of ["beads", "build", "worktrunk"]) globalThis[Symbol.for(`com.srobroek.${plugin}.present.v1`)] = { version: "0.0.0" };
+for (const plugin of ["beads", "build"]) globalThis[Symbol.for(`com.srobroek.${plugin}.present.v1`)] = { version: "0.0.0" };
 const present = await before({ prompt: "orchestrate" }, ctx);
 const presentText = present?.message?.content ?? "";
 if (!presentText.includes("orchestrate-with-bd run header") || presentText.includes("STOP.")) throw new Error(`run-header check failed: ${presentText}`);
-for (const plugin of ["beads", "build", "worktrunk"]) delete globalThis[Symbol.for(`com.srobroek.${plugin}.present.v1`)];
+for (const plugin of ["beads", "build"]) delete globalThis[Symbol.for(`com.srobroek.${plugin}.present.v1`)];
 const absent = await before({ prompt: "orchestrate" }, ctx);
 const absentText = absent?.message?.content ?? "";
-const stop = "STOP. omp-orchestrate requires companion plugins that are not loaded: beads, build, worktrunk";
+const stop = "STOP. omp-orchestrate requires companion plugins that are not loaded: beads, build";
 if (!absentText.includes(stop)) throw new Error(`companion refusal check failed: ${absentText}`);
 const reminder = handlers.get("todo_reminder");
 if (!reminder) throw new Error("todo_reminder handler was not registered");

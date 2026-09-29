@@ -1,10 +1,10 @@
 {
   "name": "orchestrate-with-bd",
-  "version": "0.7.5",
-  "description": "Durable Beads ledger and role routing on top of native OMP task orchestration.",
+  "version": "0.8.0",
+  "description": "Durable Beads ledger and serialized single-checkout routing on native OMP task orchestration.",
   "author": {
-    "name": "srobroek"
+    "name": "wricardo"
   },
-  "homepage": "https://github.com/srobroek/orchestrate-with-bd",
+  "homepage": "https://github.com/wricardo/orchestrate-with-bd",
   "license": "Apache-2.0"
 }

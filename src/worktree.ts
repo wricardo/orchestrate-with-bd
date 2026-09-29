@@ -1,23 +1,12 @@
 /**
- * Worktree facts the ledger needs: which checkout is canonical, which worktrees belong to
- * this repository, and whether a claimant's worktree is one of them.
+ * Process and repository-path utilities used by the Beads ledger.
  *
- * Every agent works in its own Worktrunk-created linked worktree, so `ctx.cwd` is a worktree
- * and the store, the workflows, and the git common directory are all in the canonical
- * checkout. Membership is *checked* rather than assumed: `git worktree list --porcelain -z` is
- * repo-scoped, so a worktree of a different repository is not a worktree of this one, and a
- * path is compared by realpath because a symlink inside a worktree can point at canonical.
- *
- * `git worktree list --porcelain` is used rather than `wt list --format json`: the latter is
- * richer but took 22 s in this repository, and a claim must not wait that long. `-z` is not a
- * refinement of it: without it a worktree path containing a newline is indistinguishable from
- * the start of a second record, so a claimant could name a path that is no worktree at all and
- * have a real record's branch attributed to it.
+ * The plugin resolves one repository root for every session and serializes its worker
+ * dispatch, so no linked checkout is created or managed here.
  */
 
 import { lstatSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
-import { agentBranch, integrationBranch } from "./types";
 
 export type CommandQuiescence = { confirmed: true } | { confirmed: false; reason: string };
 
@@ -29,7 +18,7 @@ export interface CommandResult {
 	quiescence?: CommandQuiescence;
 }
 
-/** Every git/worktree probe must finish well inside the 30 s tool/session_start budget. */
+/** Every Git probe must finish well inside the 30 s tool/session_start budget. */
 export const GIT_PROBE_TIMEOUT_MS = 5_000;
 
 /** Optional execution bound for probes that must not hold up session startup. */
@@ -92,7 +81,7 @@ async function terminateProcessTree(proc: Bun.Subprocess<"ignore", "pipe", "pipe
 	}
 	try {
 		// Timed commands are detached solely to make their pid a process-group id. SIGKILL
-		// therefore reaches Worktrunk and every foreground child doing the actual mutation.
+		// therefore reaches the command and every foreground child it started.
 		process.kill(-proc.pid, "SIGKILL");
 	} catch (error) {
 		if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
@@ -180,9 +169,9 @@ function gitOverride(): string | undefined {
 }
 
 /**
- * The absolute canonical checkout containing `cwd`: the parent of the git common directory,
- * which every linked worktree of a repository shares. An unknown result is never a root: callers
- * must refuse rather than silently redirecting a ledger operation to `cwd`.
+ * The absolute repository root containing `cwd`, derived from Git's common directory. An
+ * unknown result is never a root: callers must refuse rather than silently redirecting a ledger
+ * operation to `cwd`.
  */
 export async function canonicalRoot(cwd: string, run: CommandRunner = spawnCommand): Promise<RootResolution> {
 	const override = gitOverride();
@@ -195,106 +184,6 @@ export async function canonicalRoot(cwd: string, run: CommandRunner = spawnComma
 	// and must not be turned into a root: a guessed root would send every `bd` call elsewhere.
 	if (!path.isAbsolute(common)) return { kind: "unknown", reason: `git returned a non-absolute common directory for ${cwd}: ${common || "(empty output)"}` };
 	return { kind: "known", root: path.dirname(common) };
-}
-
-/**
- * The absolute root of the working tree containing `cwd`: the linked worktree an agent works
- * in, which is *not* canonical. An unknown result is never a working tree: callers must refuse
- * rather than guessing one.
- */
-export async function worktreeRoot(cwd: string, run: CommandRunner = spawnCommand): Promise<RootResolution> {
-	const argv = ["git", "rev-parse", "--path-format=absolute", "--show-toplevel"] as const;
-	const result = await run(argv, cwd, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
-	if (result.code !== 0) return unknownRoot(argv, cwd, result);
-	const top = result.stdout.trim();
-	// As in `canonicalRoot`: `--path-format=absolute` promises an absolute path, and anything
-	// else is not a working tree and must not be turned into one.
-	return path.isAbsolute(top) ? { kind: "known", root: top } : { kind: "unknown", reason: `git returned a non-absolute worktree for ${cwd}: ${top || "(empty output)"}` };
-}
-
-/** One `git worktree list --porcelain -z` record: `branch` is `null` when detached or bare. */
-export interface WorktreeEntry {
-	path: string;
-	branch: string | null;
-}
-
-/** The argv every worktree read uses. `-z` is load-bearing; see this module's header. */
-export const WORKTREE_LIST_ARGV: readonly string[] = ["git", "worktree", "list", "--porcelain", "-z"];
-
-/**
- * Every worktree `git worktree list --porcelain -z` reports, canonical included, in order, each
- * with the branch of *its own* record. Path and branch are never read apart: a claim that
- * matched them against two different records would brand a transposed pair.
- *
- * `-z` terminates every attribute with a NUL and ends each record with an empty attribute, so
- * a record boundary is a fact of the stream rather than a guess about which bytes in a path
- * might be a line break. An attribute arriving outside a record is dropped rather than
- * attributed to the record before it.
- */
-export function parseWorktreeEntries(stdout: string): WorktreeEntry[] {
-	const entries: WorktreeEntry[] = [];
-	let current: WorktreeEntry | undefined;
-	for (const attribute of stdout.split("\0")) {
-		if (attribute.length === 0) {
-			current = undefined;
-			continue;
-		}
-		if (attribute.startsWith("worktree ")) {
-			const value = attribute.slice("worktree ".length);
-			current = value.length === 0 ? undefined : { path: value, branch: null };
-			if (current !== undefined) entries.push(current);
-			continue;
-		}
-		if (current === undefined || current.branch !== null || !attribute.startsWith("branch ")) continue;
-		const ref = attribute.slice("branch ".length);
-		const branch = ref.startsWith("refs/heads/") ? ref.slice("refs/heads/".length) : ref;
-		if (branch.length > 0) current.branch = branch;
-	}
-	return entries;
-}
-
-/** The bead an `omp/agent/<bead>` branch names, or `null` for any other branch. */
-export function agentBeadOf(branch: string): string | null {
-	const match = /^omp\/agent\/(?<bead>[^\s/]+(?:\/[^\s/]+)*)$/u.exec(branch);
-	return match?.groups?.bead ?? null;
-}
-
-/**
- * What an unscoped `wt step prune` would remove, as its own JSON. This is a *precondition
- * probe*, never a removal: a repository whose prune would touch anything is a repository where
- * a sweep of ours could race a human's or another project's worktree, so the sweep stands down
- * and reports instead. `--dry-run --format json` prints `[]` when nothing is due.
- */
-export async function pruneCandidates(canonical: string, run: CommandRunner = spawnCommand): Promise<{ clear: boolean; named: string[] }> {
-	const argv = ["wt", "-C", canonical, "step", "prune", "--dry-run", "--format", "json"] as const;
-	const result = await run(argv, canonical, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
-	if (result.code !== 0) return { clear: false, named: [`wt step prune --dry-run failed in ${canonical}: ${commandFailure(argv, canonical, result)}`] };
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(result.stdout.trim() || "[]");
-	} catch {
-		return { clear: false, named: [`wt step prune --dry-run printed output this build cannot parse: ${result.stdout.trim().slice(0, 200)}`] };
-	}
-	if (!Array.isArray(parsed)) return { clear: false, named: ["wt step prune --dry-run printed a non-array payload"] };
-	const named = parsed.map(entry => {
-		if (entry !== null && typeof entry === "object") {
-			const record = entry as Record<string, unknown>;
-			for (const key of ["branch", "path", "worktree", "name"]) {
-				const value = record[key];
-				if (typeof value === "string" && value.length > 0) return value;
-			}
-		}
-		return JSON.stringify(entry);
-	});
-	return { clear: named.length === 0, named };
-}
-
-/** A list probe has a typed failure so an empty repository cannot be confused with an unreadable one. */
-export type WorktreeListResult = { kind: "known"; entries: WorktreeEntry[] } | { kind: "unknown"; reason: string };
-
-export async function projectWorktreeEntries(cwd: string, run: CommandRunner = spawnCommand): Promise<WorktreeListResult> {
-	const result = await run(WORKTREE_LIST_ARGV, cwd, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
-	return result.code === 0 ? { kind: "known", entries: parseWorktreeEntries(result.stdout) } : { kind: "unknown", reason: `git worktree list failed in ${cwd}: ${commandFailure(WORKTREE_LIST_ARGV, cwd, result)}` };
 }
 
 /**
@@ -317,14 +206,6 @@ export function resolveDeepest(target: string): string {
 	}
 }
 
-/** A registered path is usable only while its recorded directory still exists. */
-function isExistingDirectory(target: string): boolean {
-	try {
-		return statSync(target).isDirectory();
-	} catch {
-		return false;
-	}
-}
 
 /** Whether `target` is `root` or sits underneath it, compared by realpath, never lexically. */
 export function isInside(target: string, root: string): boolean {
@@ -333,204 +214,3 @@ export function isInside(target: string, root: string): boolean {
 	return a === b || a.startsWith(b + path.sep);
 }
 
-export type WorktreeCheck = { ok: true; path: string } | { ok: false; reason: string };
-
-/**
- * Validate a claimant-supplied worktree for `bead`. Nothing is created here: the agent
- * creates its worktree with `wt switch` and passes it in, so the ledger never has to guess a
- * base branch, and a claim can be refused before it is taken rather than rolled back after.
- */
-export function checkWorktree(input: { bead: string; worktree: string; branch: string; canonical: string; worktrees: readonly WorktreeEntry[] }): WorktreeCheck {
-	const expected = agentBranch(input.bead);
-	if (input.branch !== expected) return { ok: false, reason: `branch must be ${expected}, not ${input.branch}` };
-	if (!path.isAbsolute(input.worktree)) return { ok: false, reason: `worktree must be an absolute path, not ${input.worktree}` };
-	if (isInside(input.worktree, input.canonical)) return { ok: false, reason: `${input.worktree} is inside the canonical checkout ${input.canonical}; a bead's work never mutates canonical` };
-	const match = input.worktrees.find(candidate => resolveDeepest(candidate.path) === resolveDeepest(input.worktree));
-	if (match === undefined) return { ok: false, reason: `${input.worktree} is not a worktree of this repository (git worktree list does not report it). Create it with \`wt switch -y --create --no-cd --base <base> --format json ${expected}\`` };
-	if (!isExistingDirectory(match.path)) return { ok: false, reason: `${match.path} is a registered worktree, but its directory was deleted; recreate it before claiming ${expected}` };
-	const where = match.branch === null ? "a detached HEAD" : match.branch;
-	if (match.branch !== expected) return { ok: false, reason: `${input.worktree} is checked out on ${where}, not ${expected}; git worktree list must report this path and this branch in one record. Check you passed your own bead's worktree, not another worker's` };
-	return { ok: true, path: match.path };
-}
-
-/** Validate a lead-supplied integration worktree before any bind writes. */
-export function checkLeadWorktree(input: { epic: string; worktree: string; canonical: string; worktrees: readonly WorktreeEntry[] }): WorktreeCheck {
-	if (!path.isAbsolute(input.worktree)) return { ok: false, reason: `worktree must be an absolute path, not ${input.worktree}` };
-	if (isInside(input.worktree, input.canonical)) return { ok: false, reason: `${input.worktree} is inside the canonical checkout ${input.canonical}; canonical's working tree is never mutated` };
-	const match = input.worktrees.find(candidate => resolveDeepest(candidate.path) === resolveDeepest(input.worktree));
-	if (match === undefined) return { ok: false, reason: `${input.worktree} is not a worktree of this repository (git worktree list does not report it)` };
-	if (!isExistingDirectory(match.path)) return { ok: false, reason: `${match.path} is a registered worktree, but its directory was deleted; recreate it before binding integration files` };
-	const expected = integrationBranch(input.epic);
-	if (match.branch !== expected) {
-		const where = match.branch === null ? "a detached HEAD" : match.branch;
-		return { ok: false, reason: `${input.worktree} is checked out on ${where}, not ${expected}; git worktree list must report this exact path and integration branch in one record` };
-	}
-	return { ok: true, path: match.path };
-}
-
-export interface WorktreeRemovalResult extends CommandResult {
-	quiescence: CommandQuiescence;
-}
-
-/** Remove a bead's worktree and branch without destructive force flags. */
-export async function removeWorktree(canonical: string, branch: string, run: CommandRunner = spawnCommand): Promise<WorktreeRemovalResult> {
-	const result = await run(["wt", "-C", canonical, "remove", "-y", "--foreground", branch], canonical, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
-	if (result.quiescence !== undefined) return { ...result, quiescence: result.quiescence };
-	if (result.code === 124) {
-		return { ...result, quiescence: { confirmed: false, reason: "the command runner returned timeout status without confirming process-group disappearance" } };
-	}
-	return { ...result, quiescence: { confirmed: true } };
-}
-
-/** The independently observed state after `wt remove`; probe failures stay explicit. */
-export interface RemovalResidue {
-	worktree: boolean;
-	path: boolean;
-	branch: boolean;
-	registeredBranch?: string | null;
-	branchCheckedOutAt?: string;
-	branchMerged?: boolean;
-	worktreeError?: string;
-	branchError?: string;
-	mergeError?: string;
-	pathError?: string;
-	quiescenceError?: string;
-}
-
-/** Read registration, pathname entry, branch existence, merge, and checkout state independently. */
-export async function removalResidue(canonical: string, worktreePath: string, branch: string, run: CommandRunner = spawnCommand): Promise<RemovalResidue> {
-	const list = await run(WORKTREE_LIST_ARGV, canonical, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
-	const entries = list.code === 0 ? parseWorktreeEntries(list.stdout) : [];
-	const target = resolveDeepest(worktreePath);
-	const registered = entries.find(entry => resolveDeepest(entry.path) === target);
-	const checkedOut = entries.find(entry => entry.branch === branch);
-	const branchArgv = ["git", "branch", "--list", branch] as const;
-	const branches = await run(branchArgv, canonical, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
-	const branchPresent = branches.code === 0 && branches.stdout.trim().length > 0;
-	const mergedArgv = ["git", "branch", "--merged", "HEAD", "--list", branch] as const;
-	const merged = branchPresent ? await run(mergedArgv, canonical, { timeoutMs: GIT_PROBE_TIMEOUT_MS }) : undefined;
-	let pathPresent = true;
-	let pathError: string | undefined;
-	try {
-		lstatSync(worktreePath);
-	} catch (error) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (code === "ENOENT" || code === "ENOTDIR") pathPresent = false;
-		else pathError = error instanceof Error ? `${code ?? error.name}: ${error.message}` : String(error);
-	}
-	return {
-		worktree: list.code !== 0 || registered !== undefined,
-		path: pathPresent,
-		branch: branches.code !== 0 || branchPresent,
-		...(registered === undefined ? {} : { registeredBranch: registered.branch }),
-		...(checkedOut === undefined ? {} : { branchCheckedOutAt: checkedOut.path }),
-		...(merged?.code === 0 ? { branchMerged: merged.stdout.trim().length > 0 } : {}),
-		...(list.code === 0 ? {} : { worktreeError: commandFailure(WORKTREE_LIST_ARGV, canonical, list) }),
-		...(branches.code === 0 ? {} : { branchError: commandFailure(branchArgv, canonical, branches) }),
-		...(merged === undefined || merged.code === 0 ? {} : { mergeError: commandFailure(mergedArgv, canonical, merged) }),
-		...(pathError === undefined ? {} : { pathError }),
-	};
-}
-
-/**
- * What the forge knows about a branch that a git probe called unmerged.
- *
- * A squash merge rewrites the patch id of every commit it lands, so `git branch --list`,
- * `git cherry` and a merge-base diff all report a fully landed branch as outstanding. Measured
- * 2026-09-22 across srobroek/omp-plugins: seventeen branches whose pull requests were MERGED were
- * invisible to every git containment test in use, and only the pull request state revealed them.
- * The ledger cannot answer this either — `metadata.merge_sha` was present on 2 of 381 closed beads
- * — so the forge is the only source, and its silence is an answer in its own right.
- */
-export type ForgeLanding = { kind: "merged"; pr: number } | { kind: "unlanded" } | { kind: "unknown"; detail: string };
-
-/**
- * Ask the forge whether a MERGED pull request names this branch as its head.
- *
- * `unknown` is a first-class answer — `gh` absent, unauthenticated, offline, or a remote that is
- * not GitHub — and it is never read as landing. The failures are asymmetric: calling unlanded work
- * landed loses it, while keeping a branch too long costs one line of notice.
- */
-export async function forgeLanding(canonical: string, branch: string, run: CommandRunner = spawnCommand): Promise<ForgeLanding> {
-	const argv = ["gh", "pr", "list", "--head", branch, "--state", "all", "--json", "number,state", "--limit", "20"];
-	const result = await run(argv, canonical, { timeoutMs: GIT_PROBE_TIMEOUT_MS });
-	// 127 is its own case only to name the cause: an absent `gh` is configuration, not a fault.
-	if (result.code === 127) return { kind: "unknown", detail: "gh is not installed" };
-	if (result.code !== 0) return { kind: "unknown", detail: commandFailure(argv, canonical, result).replace(/\s+/gu, " ") };
-	let payload: unknown;
-	try {
-		payload = JSON.parse(result.stdout);
-	} catch {
-		return { kind: "unknown", detail: "gh pr list answered unparseable JSON" };
-	}
-	if (!Array.isArray(payload)) return { kind: "unknown", detail: "gh pr list answered something other than a list" };
-	for (const entry of payload) {
-		if (entry === null || typeof entry !== "object") continue;
-		const record = entry as { number?: unknown; state?: unknown };
-		if (record.state === "MERGED" && typeof record.number === "number") return { kind: "merged", pr: record.number };
-	}
-	return { kind: "unlanded" };
-}
-
-/**
- * Would a forge answer change the branch sentence `residueRemediation` produces?
- *
- * Asking the forge costs a `gh` subprocess, and every other branch of the sentence below is
- * decided by git alone: a checked-out branch belongs to its worktree, an unobservable one must
- * not be touched, and one git already calls merged is deleted with `branch -d`. Only the case
- * git reports as unmerged can be a squash landing, so that is the only case worth paying for.
- *
- * Kept beside `residueRemediation` because it mirrors that chain: change one, check the other.
- */
-export function landingDecides(residue: RemovalResidue): boolean {
-	return residue.branchError === undefined && residue.branch && residue.branchCheckedOutAt === undefined && residue.worktreeError === undefined && residue.mergeError === undefined && residue.branchMerged === false;
-}
-
-/**
- * Truthful, non-destructive remediation for the exact residue that was observed.
- *
- * Nothing here force-removes anything, and the branch sentence says only what was established:
- * "unmerged" is claimed when the forge agreed or could not be asked, never on a git probe alone,
- * because that probe cannot see a squash merge and telling a lead to "merge it" for work already
- * in main sends them to do nothing useful.
- */
-export function residueRemediation(
-	canonical: string,
-	worktreePath: string,
-	branch: string,
-	residue: RemovalResidue,
-	landing: ForgeLanding = { kind: "unknown", detail: "the forge was not asked" },
-): string {
-	const steps: string[] = [];
-	if (residue.quiescenceError !== undefined) steps.push(`process quiescence could not be confirmed: ${residue.quiescenceError}; the immediate absence snapshot is not final, so retain the brand and inspect again`);
-	if (residue.worktreeError !== undefined) steps.push(`worktree registration could not be observed: ${residue.worktreeError}`);
-	else if (residue.worktree) {
-		if (residue.registeredBranch !== branch) {
-			const owner = residue.registeredBranch === null ? "a detached HEAD" : (residue.registeredBranch ?? "an unknown branch");
-			steps.push(`the path ${worktreePath} is now registered on ${owner}, not ${branch}; leave it for its owner`);
-		} else if (residue.pathError !== undefined) steps.push(`git registers ${worktreePath} on ${branch}, but pathname state could not be observed: ${residue.pathError}; leave it untouched`);
-		else if (residue.path) steps.push(`the worktree ${worktreePath} is still registered on ${branch}: confirm its owner is not live, commit or discard its changes, then \`wt -C ${canonical} remove -y --foreground ${branch}\``);
-		else steps.push(`git still registers ${worktreePath} on ${branch}, but the path is absent; confirm its owner is not live, then inspect and repair the stale worktree registration`);
-	} else if (residue.pathError !== undefined) steps.push(`pathname state could not be observed for ${worktreePath}: ${residue.pathError}; leave it untouched`);
-	else if (residue.path) steps.push(`the path ${worktreePath} exists without a worktree registration; it may have been recreated by another process, so leave it until its owner is identified`);
-	if (residue.branchError !== undefined) steps.push(`branch state could not be observed: ${residue.branchError}`);
-	else if (residue.branch) {
-		const drop = `drop it deliberately with \`wt -C ${canonical} remove -y -D ${branch}\``;
-		if (residue.branchCheckedOutAt !== undefined) steps.push(`the branch ${branch} is checked out at ${residue.branchCheckedOutAt}; leave it for that worktree's owner`);
-		else if (residue.worktreeError !== undefined) steps.push(`the branch ${branch} exists, but checkout state could not be observed; do not delete it`);
-		else if (residue.mergeError !== undefined || residue.branchMerged === undefined) steps.push(`the branch ${branch} exists and is not checked out, but merge state could not be observed${residue.mergeError === undefined ? "" : `: ${residue.mergeError}`}; inspect it before deciding whether to delete it`);
-		else if (residue.branchMerged) steps.push(`the branch ${branch} exists, is not checked out, and is merged into canonical HEAD; delete it with \`git -C ${canonical} branch -d ${branch}\``);
-		else if (landing.kind === "merged") {
-			steps.push(
-				`the branch ${branch} is already landed — pull request #${landing.pr} is MERGED — and survives only because squashing rewrote its patch id, which no git containment test can see: ${drop}`,
-			);
-		} else if (landing.kind === "unlanded") {
-			steps.push(`the branch ${branch} exists, is not checked out, and no merged pull request names it: merge it, or ${drop}`);
-		} else {
-			steps.push(
-				`the branch ${branch} exists, is not checked out, and git reports it unmerged, and the forge could not be asked (${landing.detail}), so a squash-landed branch would look identical: check its pull request, then merge it or ${drop}`,
-			);
-		}
-	}
-	return steps.join("; ");
-}

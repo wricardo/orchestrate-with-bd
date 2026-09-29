@@ -118,24 +118,6 @@ export function waveItem(bead: BdBead): WaveItem {
 	return item;
 }
 
-/**
- * The only roles that create no worktree at all: a `planner` writes beads and never touches a
- * checkout, and a `dag-reviewer` judges the DAG through `bd`, with no pull request to check out
- * (`agents/orc-planner.md`, the DAG-review section of `agents/orc-reviewer.md`).
- */
-const WORKTREELESS_ROLES: Record<string, true> = { "dag-reviewer": true, planner: true };
-
-/**
- * Whether this bead's work happens in an `omp/agent/<bead>` worktree branded on the bead. An
- * epic lead works in its integration worktree, so an epic is never branded; every other role
- * that creates a worktree is, including a reviewer, researcher, shepherd, and merger. Their trees
- * are disposable but still recorded to be reclaimed. `orc_finish` gives a review bead's tree back
- * on every verdict, so a `fix` or `change` round builds a fresh checkout at the new head instead of
- * judging the code the previous round already saw.
- */
-export function ownsAgentWorktree(bead: BdBead): boolean {
-	return bead.issue_type !== "epic" && WORKTREELESS_ROLES[waveItem(bead).role] !== true;
-}
 
 /**
  * The run shape the DAG implies: three tiers when any direct child of the run epic is

@@ -82,15 +82,11 @@ export const OMP_JOB_CONDITION = `github.event_name != 'pull_request' || ${OMP_E
 export interface CiScopeReport {
 	/** Whether every PR-only condition in the repository now excludes pull requests into `omp/**`. */
 	scoped: boolean;
-	/** The checkout this pass read, and wrote when it wrote: the caller's own worktree. */
+	/** The checkout this pass inspected, and wrote when called with `mode: "apply"`. */
 	root: string;
 	/** Workflow files this call rewrote, relative to `root`. */
 	changed: string[];
-	/**
-	 * Workflow files that need the exclusion and were deliberately *not* written, because this
-	 * pass ran in the canonical checkout, whose working tree is never mutated. The lead applies
-	 * them in its integration worktree, where a commit can carry them.
-	 */
+	/** Workflow files that need the exclusion but were not written in report-only mode. */
 	pending: string[];
 	/** `<file>:<line>` of PR-only conditions that were already scoped. */
 	already: string[];
@@ -827,16 +823,13 @@ export function workflowFiles(root: string): WorkflowListing {
  * Scope every PR-only condition in `root`'s workflows to exclude pull requests into `omp/**`.
  * Idempotent: a second call finds every condition already scoped and changes nothing.
  *
- * `mode` is not a convenience. `root` is whichever checkout the caller works in, and the
- * canonical checkout's working tree is never mutated (`references/landing.md`): a lead that
- * binds before creating its integration worktree passes `"report"`, and the files that need the
- * edit come back as `pending` for it to apply where its commit can carry them. `"apply"`
- * rewrites in place. `scoped` is false whenever the repository still runs a PR-only condition
- * on `omp/**` branches — because this module would not rewrite it, because nothing was
- * written, or because the pass could not see what it was asked to scope. An unreadable
- * workflow directory, an entry that is not a regular file, and a file whose real path leaves
- * `root` are all reported and all hold `scoped` false: a pass that read nothing is not a
- * repository that needs nothing.
+ * `mode` distinguishes inspection from an explicit in-place edit. `"report"` returns the
+ * files that need changes without touching the shared checkout; `"apply"` rewrites in place.
+ * `scoped` is false whenever the repository still runs a PR-only condition on `omp/**`
+ * branches — because this module would not rewrite it, because nothing was written, or because
+ * the pass could not see what it was asked to scope. An unreadable workflow directory, an entry
+ * that is not a regular file, and a file whose real path leaves `root` are all reported and all
+ * hold `scoped` false: a pass that read nothing is not a repository that needs nothing.
  */
 export function scopeCi(root: string, mode: "apply" | "report"): CiScopeReport {
 	const report: CiScopeReport = { scoped: true, root, changed: [], pending: [], already: [], unhandled: [] };
@@ -892,7 +885,7 @@ export function ciScopeMessage(report: CiScopeReport): string {
 	if (report.changed.length > 0) parts.push(`CI: scoped ${report.changed.join(", ")} away from pull requests into omp/** in ${report.root} — commit this as the run's first change`);
 	if (report.pending.length > 0) {
 		parts.push(
-			`CI: ${report.pending.join(", ")} still run their whole pull-request matrix on pull requests into omp/**. Nothing was written: ${report.root} is the canonical checkout, whose working tree is never mutated. Create your integration worktree, then call orc_bind again with worktree: "<that path>" and commit the edit as the run's first change`,
+			`CI: ${report.pending.join(", ")} still run their whole pull-request matrix on pull requests into omp/**. Nothing was written. Apply the exclusion in the shared checkout and commit it before dispatching a code-writing bead`,
 		);
 	}
 	if (report.unhandled.length > 0) parts.push(`CI: scope these by hand, they were left untouched: ${report.unhandled.join("; ")}`);
