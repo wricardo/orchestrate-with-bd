@@ -1,3 +1,6 @@
+WARNING: THIS has been deprecated due to performance issues. 
+
+
 # orchestrate-with-bd
 
 An OMP plugin that records native `orchestrate` runs in a Beads ledger. OMP schedules agents; the plugin records bead ownership, dependencies, and outcomes.
